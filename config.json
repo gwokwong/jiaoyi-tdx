@@ -1,0 +1,26 @@
+{
+  "account": {
+    "initial_capital": 1000000,
+    "max_position_ratio": 0.05
+  },
+  "strategy": {
+    "scan_interval": 3,
+    "stop_loss_rate": -0.05,
+    "take_profit_rate": 0.10,
+    "market_cap_min": 10000000000,
+    "big_order_threshold": 1500,
+    "min_liangbi": 1.0,
+    "ai_signal_threshold": 0.85
+  },
+  "fees": {
+    "commission_rate": 0.0001,
+    "stamp_duty_rate": 0.0005
+  },
+  "database": {
+    "db_name": "trade_history.db"
+  },
+  "tdx": {
+    "server_ip": "123.125.108.14",
+    "server_port": 7709
+  }
+}
