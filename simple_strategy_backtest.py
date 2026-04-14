@@ -39,24 +39,68 @@ class SimpleStrategyBacktester:
         self.trade_history = []
         self.daily_records = []
 
-        # 股票池 (代码, 市场, 名称)
-        self.stock_pool = [
-            ('000001', 0, '平安银行'), ('000002', 0, '万科A'), ('000063', 0, '中兴通讯'),
-            ('000100', 0, 'TCL科技'), ('000333', 0, '美的集团'), ('000568', 0, '泸州老窖'),
-            ('000625', 0, '长安汽车'), ('000651', 0, '格力电器'), ('000725', 0, '京东方A'),
-            ('000858', 0, '五粮液'), ('002001', 0, '新和成'), ('002230', 0, '科大讯飞'),
-            ('002304', 0, '洋河股份'), ('002415', 0, '海康威视'), ('002475', 0, '立讯精密'),
-            ('002594', 0, '比亚迪'), ('300001', 0, '特锐德'), ('300750', 0, '宁德时代'),
-            ('600000', 1, '浦发银行'), ('600004', 1, '白云机场'), ('600009', 1, '上海机场'),
-            ('600010', 1, '包钢股份'), ('600015', 1, '华夏银行'), ('600016', 1, '民生银行'),
-            ('600019', 1, '宝钢股份'), ('600028', 1, '中国石化'), ('600030', 1, '中信证券'),
-            ('600031', 1, '三一重工'), ('600036', 1, '招商银行'), ('600048', 1, '保利发展'),
-            ('600050', 1, '中国联通'), ('600061', 1, '国投资本'), ('600276', 1, '恒瑞医药'),
-            ('600519', 1, '贵州茅台'),
-        ]
+        # 动态获取A股股票池
+        self.stock_pool = self.get_all_stocks()
+        print(f"📋 股票池: 共 {len(self.stock_pool)} 只股票")
 
         # 创建代码到名称的映射
         self.stock_names = {code: name for code, market, name in self.stock_pool}
+
+    def get_all_stocks(self):
+        """
+        动态获取A股所有股票
+        返回: [(code, market, name), ...]
+        """
+        stocks = []
+        print("📥 正在获取A股股票列表...")
+
+        try:
+            # 上海市场 (market=1)
+            print("   获取上海市场...")
+            sh_count = self.api.get_security_count(1)
+            for start in range(0, min(sh_count, 2000), 1000):  # 限制数量，演示用
+                chunk = self.api.get_security_list(1, start)
+                if chunk:
+                    for item in chunk:
+                        code = item['code']
+                        name = item.get('name', code)
+                        # 只保留主板股票 (60xxxx)
+                        if code.startswith('6') and len(code) == 6:
+                            stocks.append((code, 1, name))
+
+            # 深圳市场 (market=0)
+            print("   获取深圳市场...")
+            sz_count = self.api.get_security_count(0)
+            for start in range(0, min(sz_count, 2000), 1000):
+                chunk = self.api.get_security_list(0, start)
+                if chunk:
+                    for item in chunk:
+                        code = item['code']
+                        name = item.get('name', code)
+                        # 只保留主板和中小板股票 (000/001/002/300)
+                        if (code.startswith('0') or code.startswith('3')) and len(code) == 6:
+                            stocks.append((code, 0, name))
+
+        except Exception as e:
+            print(f"   获取股票列表失败: {e}")
+            # 使用默认股票池作为备用
+            stocks = [
+                ('000001', 0, '平安银行'), ('000002', 0, '万科A'), ('000063', 0, '中兴通讯'),
+                ('000100', 0, 'TCL科技'), ('000333', 0, '美的集团'), ('000568', 0, '泸州老窖'),
+                ('000625', 0, '长安汽车'), ('000651', 0, '格力电器'), ('000725', 0, '京东方A'),
+                ('000858', 0, '五粮液'), ('002001', 0, '新和成'), ('002230', 0, '科大讯飞'),
+                ('002304', 0, '洋河股份'), ('002415', 0, '海康威视'), ('002475', 0, '立讯精密'),
+                ('002594', 0, '比亚迪'), ('300001', 0, '特锐德'), ('300750', 0, '宁德时代'),
+                ('600000', 1, '浦发银行'), ('600004', 1, '白云机场'), ('600009', 1, '上海机场'),
+                ('600010', 1, '包钢股份'), ('600015', 1, '华夏银行'), ('600016', 1, '民生银行'),
+                ('600019', 1, '宝钢股份'), ('600028', 1, '中国石化'), ('600030', 1, '中信证券'),
+                ('600031', 1, '三一重工'), ('600036', 1, '招商银行'), ('600048', 1, '保利发展'),
+                ('600050', 1, '中国联通'), ('600061', 1, '国投资本'), ('600276', 1, '恒瑞医药'),
+                ('600519', 1, '贵州茅台'),
+            ]
+
+        print(f"✅ 成功获取 {len(stocks)} 只股票")
+        return stocks
 
     def get_history_data(self, code, market, days=60):
         """获取历史数据"""
@@ -225,8 +269,8 @@ class SimpleStrategyBacktester:
         buy_price = stock['buy_price']
         market = stock['market']
 
-        # 计算买入数量（单票最多5%仓位）
-        position_value = self.initial_capital * 0.05
+        # 计算买入数量（单票最多2%仓位）
+        position_value = self.initial_capital * 0.02
         vol = int(position_value / buy_price / 100) * 100
 
         if vol == 0:
@@ -278,11 +322,23 @@ class SimpleStrategyBacktester:
         return True
 
     def check_sell_signals(self, date_str):
-        """检查卖出信号"""
+        """
+        检查卖出信号（五大卖出原则）
+        1. 止盈止损（原有）
+        2. 跌破关键支撑线（原则6）
+        3. 头肩顶破颈线（原则7）
+        4. MACD顶背离（原则8）
+        5. 均线空头排列（原则9）
+        """
         sold_stocks = []
 
         for code, pos in list(self.positions.items()):
-            df = self.get_history_data(code, pos['market'], days=10)
+            df = self.get_history_data(code, pos['market'], days=60)  # 需要更多历史数据
+            if df is None or len(df) < 30:
+                continue
+
+            # 计算技术指标
+            df = self.calculate_sell_indicators(df)
             if df is None:
                 continue
 
@@ -297,16 +353,39 @@ class SimpleStrategyBacktester:
             buy_price = pos['buy_price']
             pnl_pct = (current_price - buy_price) / buy_price
 
+            # 检查各种卖出信号
+            sell_signals = []
+
+            # 1. 止盈止损
             stop_loss = -0.05  # 固定止损5%
             take_profit = 0.10   # 固定止盈10%
 
-            action_type = None
             if pnl_pct <= stop_loss:
-                action_type = "止损"
+                sell_signals.append(("止损", f"亏损达到{pnl_pct*100:.1f}%"))
             elif pnl_pct >= take_profit:
-                action_type = "止盈"
+                sell_signals.append(("止盈", f"盈利达到{pnl_pct*100:.1f}%"))
 
-            if action_type:
+            # 2. 原则6: 跌破关键支撑线（20日线）
+            support_break = self.check_support_break(df)
+            if support_break:
+                sell_signals.append(("跌破支撑", "收盘价跌破20日均线且放量"))
+
+            # 3. 原则7: 头肩顶破颈线（简化版：双顶形态）
+            head_shoulder = self.check_head_shoulder(df)
+            if head_shoulder:
+                sell_signals.append(("形态破位", "双顶形态跌破颈线"))
+
+            # 4. 原则8: MACD顶背离
+            macd_divergence = self.check_macd_divergence(df)
+            if macd_divergence:
+                sell_signals.append(("MACD顶背离", "价格新高但MACD未新高"))
+
+            # 5. 原则9: 均线空头排列
+            ma_bearish = self.check_ma_bearish(df)
+            if ma_bearish:
+                sell_signals.append(("空头排列", "5/10/20/60日均线空头排列"))
+
+            if sell_signals:
                 vol = pos['vol']
                 income = current_price * vol
                 comm = income * self.config.get('fees', 'commission_rate')
@@ -317,6 +396,9 @@ class SimpleStrategyBacktester:
                 self.cash += (income - total_fee)
 
                 name = pos.get('name', self.stock_names.get(code, '未知'))
+
+                # 取第一个卖出信号
+                action_type, reason = sell_signals[0]
 
                 self.trade_history.append({
                     'date': date_str,
@@ -330,6 +412,7 @@ class SimpleStrategyBacktester:
                     'profit': profit,
                     'pnl_pct': pnl_pct * 100,
                     'type': action_type,
+                    'reason': reason,
                     'cash_after': self.cash
                 })
 
@@ -338,12 +421,185 @@ class SimpleStrategyBacktester:
                                   self.config.get('fees', 'stamp_duty_rate'))
 
                 print(f"   🔴 卖出 {code} {name} @ {current_price:.2f} | {action_type}")
+                print(f"      原因: {reason}")
                 print(f"      盈亏: {pnl_pct*100:+.2f}% | 收益: {profit:+.2f}元")
 
                 del self.positions[code]
                 sold_stocks.append(code)
 
         return sold_stocks
+
+    def calculate_sell_indicators(self, df):
+        """
+        计算卖出所需的技术指标
+        """
+        if df is None or len(df) < 30:
+            return None
+
+        # 移动平均线
+        df['MA5'] = df['close'].rolling(window=5).mean()
+        df['MA10'] = df['close'].rolling(window=10).mean()
+        df['MA20'] = df['close'].rolling(window=20).mean()
+        df['MA60'] = df['close'].rolling(window=60).mean()
+
+        # MACD
+        ema12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['DIF'] = ema12 - ema26
+        df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
+        df['MACD'] = (df['DIF'] - df['DEA']) * 2
+
+        # 成交量均线
+        df['VOL_MA5'] = df['vol'].rolling(window=5).mean()
+
+        return df
+
+    def check_support_break(self, df):
+        """
+        原则6: 跌破关键支撑线（20日均线）
+        条件:
+        - 收盘价 < 20日均线 * 0.995
+        - 昨日收盘价 > 20日均线
+        - 放量(量比≥1.3) 或 大阴线(跌幅≥3%)
+        """
+        if len(df) < 2:
+            return False
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # 有效跌破: 收盘价 < 20日均线 * 0.995
+        support_line = latest['MA20']
+        break_down = latest['close'] < support_line * 0.995
+        was_above = prev['close'] > prev['MA20']
+
+        # 放量或大阴线
+        vol_ratio = latest['vol'] / latest['VOL_MA5'] if latest['VOL_MA5'] > 0 else 0
+        high_volume = vol_ratio >= 1.3
+
+        change_pct = (latest['close'] - latest['open']) / latest['open'] * 100
+        big_drop = change_pct <= -3
+
+        return break_down and was_above and (high_volume or big_drop)
+
+    def check_head_shoulder(self, df):
+        """
+        原则7: 头肩顶破颈线（简化版：双顶形态）
+        条件:
+        - 近30日有两个相近的高点（双顶）
+        - 跌破颈线（两低点连线）
+        - 放量破位
+        """
+        if len(df) < 30:
+            return False
+
+        recent = df.iloc[-30:]
+        highs = recent['high'].values
+        lows = recent['low'].values
+
+        # 找近30日的两个最高点
+        max1_idx = recent['high'].idxmax()
+        max1_val = recent.loc[max1_idx, 'high']
+
+        # 排除最高点附近的次高点
+        exclude_range = 5
+        mask = (recent.index < max1_idx - pd.Timedelta(days=exclude_range)) | \
+               (recent.index > max1_idx + pd.Timedelta(days=exclude_range))
+        remaining = recent[mask]
+
+        if len(remaining) < 5:
+            return False
+
+        max2_idx = remaining['high'].idxmax()
+        max2_val = remaining.loc[max2_idx, 'high']
+
+        # 双顶条件：两个高点相近（差距<5%），且都较高
+        if abs(max1_val - max2_val) / max1_val > 0.05:
+            return False
+
+        # 找颈线（两个高点之间的最低点）
+        between = recent[(recent.index > min(max1_idx, max2_idx)) &
+                         (recent.index < max(max1_idx, max2_idx))]
+        if len(between) == 0:
+            return False
+
+        neckline = between['low'].min()
+
+        # 当前价格跌破颈线
+        latest = df.iloc[-1]
+        break_neckline = latest['close'] < neckline * 0.995
+
+        # 放量
+        vol_ratio = latest['vol'] / latest['VOL_MA5'] if latest['VOL_MA5'] > 0 else 0
+        high_volume = vol_ratio >= 1.5
+
+        return break_neckline and high_volume
+
+    def check_macd_divergence(self, df):
+        """
+        原则8: MACD顶背离
+        条件:
+        - 价格创近30日新高
+        - MACD(DIF)未创新高（下降≥5%）
+        - 柱状线未创新高
+        - 量能萎缩（<前一高点80%）
+        """
+        if len(df) < 30:
+            return False
+
+        recent = df.iloc[-30:]
+
+        # 价格新高
+        price_high = recent['high'].max()
+        latest_price = df.iloc[-1]['close']
+
+        if latest_price < price_high * 0.98:  # 当前价格接近高点
+            return False
+
+        # 找到价格高点对应的MACD值
+        high_idx = recent['high'].idxmax()
+        macd_at_high = df.loc[high_idx, 'DIF']
+
+        # 当前MACD
+        latest_macd = df.iloc[-1]['DIF']
+
+        # MACD未新高（下降≥5%）
+        if latest_macd >= macd_at_high * 0.95:
+            return False
+
+        # 柱状线也未新高
+        hist_at_high = df.loc[high_idx, 'MACD']
+        latest_hist = df.iloc[-1]['MACD']
+
+        if latest_hist >= hist_at_high * 0.95:
+            return False
+
+        return True
+
+    def check_ma_bearish(self, df):
+        """
+        原则9: 均线空头排列
+        条件:
+        - 5日 < 10日 < 20日 < 60日
+        - 股价连续3日在20日线下方
+        - 无明显缩量企稳
+        """
+        if len(df) < 5:
+            return False
+
+        latest = df.iloc[-1]
+
+        # 空头排列
+        bearish = (latest['MA5'] < latest['MA10'] < latest['MA20'] < latest['MA60'])
+
+        if not bearish:
+            return False
+
+        # 连续3日在20日线下方
+        recent_3 = df.iloc[-3:]
+        below_ma20 = all(recent_3['close'] < recent_3['MA20'])
+
+        return below_ma20
 
     def record_daily_status(self, date_str):
         """记录每日状态"""
@@ -364,14 +620,15 @@ class SimpleStrategyBacktester:
         print("📈 简化版策略回测系统")
         print("="*80)
         # 配置参数
-        self.max_positions = 100  # 最大持仓数量
-        self.min_cash_ratio = 0.1  # 最小现金比例(10%)
+        self.max_positions = 60  # 最大持仓数量
+        self.min_cash_ratio = 0.5  # 最小现金比例(50%)，即总仓位不超过50%
+        self.max_total_position = 0.5  # 最大总仓位50%
 
         print(f"\n💰 初始资金: {self.initial_capital:,.2f} 元")
         print(f"📅 回测期间: {start_date} 至 {end_date}")
         print(f"📋 股票池: {len(self.stock_pool)} 只股票")
         print(f"📊 策略: 五大策略（满足其一即可买入）")
-        print(f"🛡️ 风控: 单票仓位≤5%, 最大持仓{self.max_positions}只, 止盈10%, 止损5%")
+        print(f"🛡️ 风控: 单票仓位≤2%, 最大持仓{self.max_positions}只, 总仓位≤50%, 止盈10%, 止损5%")
         print("\n" + "="*80)
 
         date_range = pd.date_range(start=start_date, end=end_date, freq='B')
