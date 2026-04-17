@@ -340,7 +340,7 @@ class TradingCore:
 
     # ==================== 股票池管理 ====================
 
-    def get_all_stocks(self, limit=2000):
+    def get_all_stocks(self, limit=None):
         """
         获取A股所有股票
         返回: [(code, market, name), ...]
@@ -351,7 +351,9 @@ class TradingCore:
         try:
             # 上海市场
             sh_count = self.api.get_security_count(1)
-            for start in range(0, min(sh_count, limit), 1000):
+            print(f"   上海市场共 {sh_count} 只股票")
+            sh_limit = min(sh_count, limit) if limit else sh_count
+            for start in range(0, sh_limit, 1000):
                 chunk = self.api.get_security_list(1, start)
                 if chunk:
                     for item in chunk:
@@ -362,7 +364,9 @@ class TradingCore:
 
             # 深圳市场
             sz_count = self.api.get_security_count(0)
-            for start in range(0, min(sz_count, limit), 1000):
+            print(f"   深圳市场共 {sz_count} 只股票")
+            sz_limit = min(sz_count, limit) if limit else sz_count
+            for start in range(0, sz_limit, 1000):
                 chunk = self.api.get_security_list(0, start)
                 if chunk:
                     for item in chunk:
