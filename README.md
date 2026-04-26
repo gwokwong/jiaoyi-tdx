@@ -6,14 +6,23 @@
 
 ```
 jiaoyi/
-├── core.py              # 核心模块
-├── backtester.py        # 回测引擎
-├── live_trader.py       # 实盘交易
-├── config.json          # 配置文件
-├── run_backtest.sh      # 回测启动脚本
-├── run_live.sh          # 实盘启动脚本
-├── check_days.py        # 交易日检查工具
-└── trade_history.db     # SQLite数据库（自动创建）
+├── core.py                    # 核心模块
+├── backtester.py              # 回测引擎
+├── live_trader.py             # 实盘交易
+├── config.json                # 配置文件
+├── run_backtest.sh            # 回测启动脚本
+├── run_live.sh                # 实盘启动脚本
+├── check_days.py              # 交易日检查工具
+├── trade_history.db           # SQLite数据库（自动创建）
+├── strategies/                # 策略监控系统
+│   ├── README.md
+│   ├── breakout_strategy/     # 放量突破策略
+│   ├── ma_trend_strategy/     # 均线趋势策略
+│   ├── macd_kdj_strategy/     # MACD+KDJ金叉策略
+│   ├── momentum_strategy/     # 动量策略
+│   └── resonance_alert/       # 多周期共振策略
+└── resonance_alert/           # 多周期共振系统
+    └── src/
 ```
 
 ## 🚀 快速开始

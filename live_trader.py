@@ -20,14 +20,10 @@ logger = logging.getLogger(__name__)
 class LiveTrader:
     """
     实盘交易器：负责连接实时行情，执行买卖
-    优化点：
-    1. 使用日志替代print，支持日志级别控制
-    2. 添加异常处理和重连机制
-    3. 添加止盈逻辑
-    4. 批量获取实时价格
-    5. 添加仓位管理和风险控制
-    6. 添加滑点、最小交易单位等实盘细节
-    7. 优雅退出和资源清理
+    功能：
+    1. 盘中实时监控持仓（止损/止盈）
+    2. 盘中实时选股并自动买入
+    3. 完整的仓位管理和风险控制
     """
 
     # A股最小交易单位
@@ -41,13 +37,19 @@ class LiveTrader:
         self.api = None
         self.db = None
 
-        # 风控参数（从配置读取，使用默认值）
+        # 风控参数
         self.max_single_position = config.get('risk', 'max_single_position', default=0.10)
         self.max_total_position = config.get('risk', 'max_total_position', default=0.80)
         self.max_positions = config.get('risk', 'max_positions', default=10)
+        self.max_buys_per_day = config.get('risk', 'max_buys_per_day', default=5)
         self.stop_loss = config.get('strategy', 'stop_loss_rate', default=-0.05)
         self.take_profit = config.get('strategy', 'take_profit_rate', default=0.10)
         self.slippage = config.get('trading', 'slippage', default=self.DEFAULT_SLIPPAGE)
+
+        # 选股参数
+        self.scan_stocks_count = config.get('strategy', 'scan_stocks_count', default=100)
+        self.min_stock_price = config.get('strategy', 'min_stock_price', default=2.0)
+        self.max_stock_price = config.get('strategy', 'max_stock_price', default=500.0)
 
         # 账户状态
         self.cash = 0.0
@@ -55,14 +57,20 @@ class LiveTrader:
         self.daily_stats = {
             'buy_count': 0,
             'sell_count': 0,
-            'max_buys_per_day': config.get('risk', 'max_buys_per_day', default=5)
+            'max_buys_per_day': self.max_buys_per_day,
+            'last_scan_time': None
         }
 
-        # 初始化连接
+        # 股票池缓存
+        self.stock_pool = []  # [(code, market, name), ...]
+        self.stock_pool_updated = None
+
+        # 初始化
         self._init_connection()
         self._init_account()
+        self._init_stock_pool()
 
-        # 设置信号处理（优雅退出）
+        # 信号处理
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
@@ -90,17 +98,15 @@ class LiveTrader:
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                 else:
-                    raise Exception(f"连接通达信失败，已重试{max_retries}次，请检查网络或IP配置")
+                    raise Exception(f"连接通达信失败，已重试{max_retries}次")
 
     def _init_account(self):
         """初始化账户和数据库"""
         try:
             self.db = DatabaseManager(self.config)
-            # 从数据库加载之前的持仓
             self.positions = self.db.load_positions()
             logger.info(f"📊 从数据库加载 {len(self.positions)} 只持仓")
 
-            # 从数据库读取现金余额，如果没有则使用配置文件的初始资金
             db_cash = self.db.get_cash_balance() if hasattr(self.db, 'get_cash_balance') else None
             if db_cash is not None:
                 self.cash = db_cash
@@ -113,8 +119,15 @@ class LiveTrader:
             logger.error(f"初始化账户失败: {e}")
             raise
 
+    def _init_stock_pool(self):
+        """初始化股票池"""
+        logger.info("📥 正在初始化股票池...")
+        self.stock_pool = self._get_stock_pool()
+        self.stock_pool_updated = datetime.datetime.now()
+        logger.info(f"✅ 股票池初始化完成，共 {len(self.stock_pool)} 只股票")
+
     def _signal_handler(self, signum, frame):
-        """信号处理函数，实现优雅退出"""
+        """信号处理函数"""
         logger.info(f"\n👋 接收到信号 {signum}，正在优雅退出...")
         self.running = False
 
@@ -136,9 +149,7 @@ class LiveTrader:
             logger.error(f"断开通达信连接失败: {e}")
 
     def run(self):
-        """
-        主循环：程序会一直在这里跑，直到接收到停止信号
-        """
+        """主循环"""
         self.running = True
         scan_interval = self.config.get('strategy', 'scan_interval', default=30)
 
@@ -150,21 +161,17 @@ class LiveTrader:
                         self._handle_non_trading_time()
                         continue
 
-                    # 2. 重置每日统计（新的一天）
-                    self._reset_daily_stats_if_needed()
-
-                    # 3. 监控现有持仓（检查止损/止盈）
+                    # 2. 监控持仓（止损/止盈）
                     self.check_positions()
 
-                    # 4. 扫描市场新机会（选股）
+                    # 3. 扫描市场并执行买入
                     self.scan_market()
 
-                    # 5. 心跳等待
+                    # 4. 心跳等待
                     time.sleep(scan_interval)
 
                 except Exception as e:
                     logger.error(f"主循环异常: {e}", exc_info=True)
-                    # 短暂暂停后继续，避免异常时CPU空转
                     time.sleep(5)
 
         finally:
@@ -172,46 +179,33 @@ class LiveTrader:
             logger.info("👋 策略已停止")
 
     def _handle_non_trading_time(self):
-        """处理非交易时间的逻辑"""
+        """处理非交易时间"""
         now = datetime.datetime.now()
 
-        # 判断是否是交易日（简化版，实际应该用交易日历）
-        if now.weekday() >= 5:  # 周末
+        if now.weekday() >= 5:
             next_open = self._get_next_trading_day(now)
             sleep_seconds = (next_open - now).total_seconds()
             logger.info(f"⏰ 周末休市，下次开盘: {next_open.strftime('%Y-%m-%d %H:%M')}")
-            time.sleep(min(sleep_seconds, 3600))  # 最多休眠1小时
+            time.sleep(min(sleep_seconds, 3600))
         else:
-            # 盘中休市时间
             logger.info("⏰ 非交易时间，休眠中...")
             time.sleep(60)
 
     def _get_next_trading_day(self, from_date):
-        """获取下一个交易日的开盘时间"""
+        """获取下一个交易日"""
         next_day = from_date + datetime.timedelta(days=1)
-        while next_day.weekday() >= 5:  # 跳过周末
+        while next_day.weekday() >= 5:
             next_day += datetime.timedelta(days=1)
         return next_day.replace(hour=9, minute=30, second=0, microsecond=0)
 
-    def _reset_daily_stats_if_needed(self):
-        """如果需要，重置每日统计"""
-        # 这里可以实现按天重置统计逻辑
-        pass
-
     def is_trading_time(self):
-        """
-        判断当前是否在 A 股开盘时间
-        优化：添加对周末的判断
-        """
+        """判断是否在交易时间"""
         now = datetime.datetime.now()
 
-        # 周末不开盘
         if now.weekday() >= 5:
             return False
 
         current_time = now.time()
-
-        # 定义开盘时间段
         morning_start = datetime.time(9, 30)
         morning_end = datetime.time(11, 30)
         afternoon_start = datetime.time(13, 0)
@@ -221,61 +215,203 @@ class LiveTrader:
                (afternoon_start <= current_time <= afternoon_end)
 
     def get_market_type(self, code):
-        """
-        根据股票代码判断市场类型
-        0: 深圳, 1: 上海
-        """
+        """根据代码判断市场类型"""
         if code.startswith('6'):
-            return 1  # 上海
+            return 1
         elif code.startswith('0') or code.startswith('3'):
-            return 0  # 深圳
-        else:
-            return 0  # 默认深圳
+            return 0
+        return 0
+
+    def _get_stock_pool(self):
+        """
+        获取股票池
+        返回: [(code, market, name), ...]
+        """
+        stocks = []
+
+        try:
+            # 上海市场
+            sh_count = self.api.get_security_count(1)
+            sh_limit = min(sh_count, self.scan_stocks_count // 2)
+            for start in range(0, sh_limit, 1000):
+                chunk = self.api.get_security_list(1, start)
+                if chunk:
+                    for item in chunk:
+                        code = item['code']
+                        name = item.get('name', code)
+                        if code.startswith('6') and len(code) == 6:
+                            stocks.append((code, 1, name))
+
+            # 深圳市场
+            sz_count = self.api.get_security_count(0)
+            sz_limit = min(sz_count, self.scan_stocks_count // 2)
+            for start in range(0, sz_limit, 1000):
+                chunk = self.api.get_security_list(0, start)
+                if chunk:
+                    for item in chunk:
+                        code = item['code']
+                        name = item.get('name', code)
+                        if (code.startswith('0') or code.startswith('3')) and len(code) == 6:
+                            stocks.append((code, 0, name))
+
+        except Exception as e:
+            logger.error(f"获取股票池失败: {e}")
+
+        return stocks
+
+    def get_history_data(self, code, market, days=60):
+        """获取历史K线数据"""
+        try:
+            data = self.api.get_security_bars(9, market, code, 0, days)  # 9=1分钟线
+            if not data or len(data) < 30:
+                # 如果分钟线不足，尝试日线
+                data = self.api.get_security_bars(4, market, code, 0, days)
+
+            if not data:
+                return None
+
+            # 转换为列表格式
+            bars = []
+            for item in data:
+                bars.append({
+                    'datetime': item['datetime'],
+                    'open': item['open'],
+                    'high': item['high'],
+                    'low': item['low'],
+                    'close': item['close'],
+                    'volume': item['vol'],
+                    'amount': item.get('amount', 0)
+                })
+
+            return bars
+        except Exception as e:
+            logger.error(f"获取 {code} 历史数据失败: {e}")
+            return None
+
+    def calculate_indicators(self, bars):
+        """计算技术指标"""
+        if not bars or len(bars) < 30:
+            return None
+
+        # 计算MA
+        closes = [b['close'] for b in bars]
+        volumes = [b['volume'] for b in bars]
+
+        latest = bars[-1]
+        prev = bars[-2] if len(bars) >= 2 else latest
+
+        # 简单移动平均线
+        ma5 = sum(closes[-5:]) / 5
+        ma10 = sum(closes[-10:]) / 10
+        ma20 = sum(closes[-20:]) / 20
+
+        # 成交量均线
+        vol_ma5 = sum(volumes[-5:]) / 5
+        vol_ma20 = sum(volumes[-20:]) / 20
+
+        # 涨跌幅
+        change_pct = (latest['close'] - prev['close']) / prev['close'] * 100 if prev['close'] > 0 else 0
+
+        # 量比
+        vol_ratio = latest['volume'] / vol_ma5 if vol_ma5 > 0 else 0
+
+        # 是否阳线
+        is_yang = latest['close'] > latest['open']
+
+        return {
+            'latest': latest,
+            'prev': prev,
+            'ma5': ma5,
+            'ma10': ma10,
+            'ma20': ma20,
+            'vol_ma5': vol_ma5,
+            'vol_ma20': vol_ma20,
+            'change_pct': change_pct,
+            'vol_ratio': vol_ratio,
+            'is_yang': is_yang,
+            'high_20': max(b['high'] for b in bars[-20:]),
+            'low_20': min(b['low'] for b in bars[-20:])
+        }
+
+    def check_buy_signals(self, indicators):
+        """
+        检查买入信号
+        返回: (signal_type, score, reason) 或 None
+        """
+        if not indicators:
+            return None
+
+        ind = indicators
+        latest = ind['latest']
+        price = latest['close']
+
+        # 价格过滤
+        if price < self.min_stock_price or price > self.max_stock_price:
+            return None
+
+        signals = []
+
+        # 策略1: 放量突破
+        if (ind['is_yang'] and
+            ind['change_pct'] >= 1.0 and
+            ind['vol_ratio'] >= 1.2):
+            signals.append(('放量突破', 3, f"阳线上涨{ind['change_pct']:.1f}%，放量{ind['vol_ratio']:.1f}倍"))
+
+        # 策略2: 均线多头排列
+        if (ind['ma5'] > ind['ma10'] > ind['ma20'] and
+            price > ind['ma5']):
+            signals.append(('均线多头', 2, "5/10/20日均线多头排列"))
+
+        # 策略3: 接近新高
+        near_high = price > ind['high_20'] * 0.98
+        if near_high and ind['is_yang']:
+            signals.append(('接近新高', 2, f"股价接近20日新高{ind['high_20']:.2f}"))
+
+        # 策略4: 超跌反弹
+        if len(signals) == 0:
+            recent_bars = [b for b in [ind['latest'], ind['prev']] if b]
+            if len(recent_bars) >= 2:
+                recent_change = (recent_bars[-1]['close'] - recent_bars[0]['close']) / recent_bars[0]['close'] * 100
+                if recent_change < -5 and ind['is_yang']:
+                    signals.append(('超跌反弹', 2, f"近期下跌后反弹"))
+
+        if signals:
+            # 返回得分最高的信号
+            best = max(signals, key=lambda x: x[1])
+            return best
+
+        return None
 
     def get_realtime_prices(self, codes):
-        """
-        批量获取股票实时价格
-        返回: {code: {'price': float, 'bid': float, 'ask': float}, ...}
-        """
+        """批量获取实时价格"""
         prices = {}
 
         if not codes:
             return prices
 
         try:
-            # 通达信API限制，每次最多获取80只
             batch_size = 80
             for i in range(0, len(codes), batch_size):
                 batch = codes[i:i + batch_size]
+                market_codes = [(self.get_market_type(code), code) for code in batch]
 
-                # 构建市场代码列表
-                market_codes = []
-                for code in batch:
-                    market = self.get_market_type(code)
-                    market_codes.append((market, code))
-
-                # 获取实时行情
                 quotes = self.api.get_security_quotes(market_codes)
 
                 if quotes:
                     for quote in quotes:
                         code = quote.get('code')
-                        # 使用最新价，如果没有则使用收盘价
                         price = quote.get('price', 0)
                         if price == 0:
                             price = quote.get('close', 0)
 
-                        # 买卖盘价格
-                        bid = quote.get('bid1', price * 0.999) if price > 0 else 0
-                        ask = quote.get('ask1', price * 1.001) if price > 0 else 0
-
                         prices[code] = {
                             'price': price,
-                            'bid': bid,
-                            'ask': ask,
+                            'bid': quote.get('bid1', price * 0.999) if price > 0 else 0,
+                            'ask': quote.get('ask1', price * 1.001) if price > 0 else 0,
                             'high': quote.get('high', 0),
                             'low': quote.get('low', 0),
-                            'volume': quote.get('vol', 0)
+                            'volume': quote.get('vol', 0),
+                            'open': quote.get('open', 0)
                         }
 
         except Exception as e:
@@ -284,16 +420,12 @@ class LiveTrader:
         return prices
 
     def check_positions(self):
-        """
-        持仓监控：遍历手里的每一只股票，看是否触发止损或止盈
-        优化：批量获取价格，添加止盈逻辑
-        """
+        """监控持仓（止损/止盈）"""
         if not self.positions:
             return
 
         logger.info(f"--- 🛡️ 正在监控 {len(self.positions)} 只持仓 ---")
 
-        # 批量获取所有持仓股票的实时价格
         codes = list(self.positions.keys())
         quotes = self.get_realtime_prices(codes)
 
@@ -301,156 +433,193 @@ class LiveTrader:
             quote = quotes.get(code)
 
             if not quote or quote['price'] <= 0:
-                logger.warning(f"⚠️ 无法获取 {code} 的实时价格，跳过检查")
+                logger.warning(f"⚠️ 无法获取 {code} 的实时价格")
                 continue
 
             current_price = quote['price']
             cost_price = pos['cost']
-
-            # 计算盈亏比例
             pnl_rate = (current_price - cost_price) / cost_price
 
-            # 触发止损
+            # 止损
             if pnl_rate <= self.stop_loss:
-                logger.warning(f"🔴 触发止损 {code}，亏损 {pnl_rate:.2%}，执行卖出")
+                logger.warning(f"🔴 触发止损 {code}，亏损 {pnl_rate:.2%}")
                 self.execute_sell(code, current_price, pos['vol'])
 
-            # 触发止盈
+            # 止盈
             elif pnl_rate >= self.take_profit:
-                logger.info(f"🟢 触发止盈 {code}，盈利 {pnl_rate:.2%}，执行卖出")
+                logger.info(f"🟢 触发止盈 {code}，盈利 {pnl_rate:.2%}")
                 self.execute_sell(code, current_price, pos['vol'])
 
             else:
-                # 正常持仓，打印盈亏情况
                 logger.info(f"📊 {code}: 成本 {cost_price:.2f}, 现价 {current_price:.2f}, 盈亏 {pnl_rate:+.2%}")
 
     def scan_market(self):
         """
-        市场扫描：选股逻辑
-        优化：添加风险控制检查
+        盘中实时扫描市场，选股并买入
         """
-        # 检查是否达到最大持仓数
+        # 风险控制检查
         if len(self.positions) >= self.max_positions:
-            logger.debug(f"已达到最大持仓数 {self.max_positions}，暂停扫描")
             return
 
-        # 检查当日买入次数限制
-        if self.daily_stats['buy_count'] >= self.daily_stats['max_buys_per_day']:
-            logger.debug(f"已达到当日最大买入次数 {self.daily_stats['max_buys_per_day']}，暂停扫描")
+        if self.daily_stats['buy_count'] >= self.max_buys_per_day:
             return
 
-        # 检查仓位限制
         total_position_value = sum(p['vol'] * p['cost'] for p in self.positions.values())
         total_capital = self.cash + total_position_value
 
         if total_position_value >= total_capital * self.max_total_position:
-            logger.debug(f"已达到最大总仓位 {self.max_total_position:.0%}，暂停扫描")
             return
 
-        # TODO: 在这里实现具体的选股逻辑
-        # 示例：
-        # candidates = self.select_stocks()
-        # for stock in candidates:
-        #     if self.can_buy(stock):
-        #         self.execute_buy(stock['code'], stock['price'], stock['vol'])
+        logger.info(f"--- 🔍 开始扫描市场（目标股票数: {len(self.stock_pool)}） ---")
 
-        pass
+        # 限制扫描数量，避免请求过于频繁
+        scan_limit = min(50, len(self.stock_pool))
+        candidates = []
+
+        for i, (code, market, name) in enumerate(self.stock_pool[:scan_limit]):
+            # 跳过已持仓
+            if code in self.positions:
+                continue
+
+            try:
+                # 获取历史数据
+                bars = self.get_history_data(code, market, days=30)
+                if not bars:
+                    continue
+
+                # 计算指标
+                indicators = self.calculate_indicators(bars)
+                if not indicators:
+                    continue
+
+                # 检查买入信号
+                signal = self.check_buy_signals(indicators)
+                if signal:
+                    signal_type, score, reason = signal
+                    latest = indicators['latest']
+
+                    candidates.append({
+                        'code': code,
+                        'market': market,
+                        'name': name,
+                        'price': latest['close'],
+                        'signal_type': signal_type,
+                        'score': score,
+                        'reason': reason,
+                        'change_pct': indicators['change_pct'],
+                        'vol_ratio': indicators['vol_ratio']
+                    })
+
+                    logger.info(f"📈 发现信号: {code} {name} | {signal_type} | {reason}")
+
+            except Exception as e:
+                logger.debug(f"扫描 {code} 时出错: {e}")
+                continue
+
+            # 每扫描10只股票暂停一下，避免请求过快
+            if (i + 1) % 10 == 0:
+                time.sleep(0.5)
+
+        # 按得分排序，选择最佳候选
+        if candidates:
+            candidates.sort(key=lambda x: x['score'], reverse=True)
+            best = candidates[0]
+
+            logger.info(f"\n🎯 最佳候选: {best['code']} {best['name']}")
+            logger.info(f"   信号: {best['signal_type']}")
+            logger.info(f"   原因: {best['reason']}")
+            logger.info(f"   当前价: {best['price']:.2f}")
+
+            # 执行买入
+            self._execute_buy_for_candidate(best)
+        else:
+            logger.info("📭 本次扫描未发现买入信号")
+
+    def _execute_buy_for_candidate(self, candidate):
+        """为候选股票执行买入"""
+        code = candidate['code']
+        price = candidate['price']
+
+        # 计算买入数量
+        vol = self.calculate_buy_volume(price)
+
+        if vol < self.MIN_TRADE_UNIT:
+            logger.warning(f"计算数量不足 {self.MIN_TRADE_UNIT} 股，放弃买入")
+            return
+
+        # 检查风控
+        if not self.can_buy(code, price, vol):
+            return
+
+        # 执行买入
+        success = self.execute_buy(code, price, vol)
+
+        if success:
+            logger.info(f"✅ 成功买入 {code}，原因: {candidate['reason']}")
 
     def can_buy(self, code, price, vol):
-        """
-        检查是否可以买入（风险控制）
-        """
-        # 检查是否已持仓
+        """检查是否可以买入"""
         if code in self.positions:
-            logger.debug(f"{code} 已在持仓中")
             return False
 
-        # 检查持仓数量限制
         if len(self.positions) >= self.max_positions:
-            logger.warning(f"已达到最大持仓数 {self.max_positions}")
             return False
 
-        # 检查当日买入次数
-        if self.daily_stats['buy_count'] >= self.daily_stats['max_buys_per_day']:
-            logger.warning(f"已达到当日最大买入次数")
+        if self.daily_stats['buy_count'] >= self.max_buys_per_day:
             return False
 
-        # 计算所需资金（含滑点）
         required = price * vol * (1 + self.slippage)
         fee = required * self.config.get('fees', 'commission_rate', default=0.00025)
         total_cost = required + fee
 
-        # 检查资金是否充足
         if self.cash < total_cost:
-            logger.warning(f"资金不足，需要 {total_cost:.2f}，可用 {self.cash:.2f}")
             return False
 
-        # 检查单票仓位限制
         total_capital = self.cash + sum(p['vol'] * p['cost'] for p in self.positions.values())
         position_value = price * vol
 
         if position_value > total_capital * self.max_single_position:
-            logger.warning(f"单票仓位超限，需要调整数量")
             return False
 
         return True
 
     def calculate_buy_volume(self, price, max_position_value=None):
-        """
-        计算可买入数量（考虑最小交易单位）
-        """
+        """计算可买入数量"""
         if max_position_value is None:
-            # 默认使用单票最大仓位
             total_capital = self.cash + sum(p['vol'] * p['cost'] for p in self.positions.values())
             max_position_value = total_capital * self.max_single_position
 
-        # 考虑滑点和手续费后的可用资金
         available_cash = self.cash / (1 + self.slippage) / (1 + self.config.get('fees', 'commission_rate', default=0.00025))
-
-        # 取较小值
         max_value = min(max_position_value, available_cash)
-
-        # 计算股数（100股整数倍）
         vol = int(max_value / price / self.MIN_TRADE_UNIT) * self.MIN_TRADE_UNIT
 
         return vol
 
     def execute_buy(self, code, price, vol=None):
-        """
-        执行买入操作
-        优化：添加滑点、自动计算数量、完善错误处理
-        """
+        """执行买入"""
         try:
-            # 如果未指定数量，自动计算
             if vol is None:
                 vol = self.calculate_buy_volume(price)
 
             if vol < self.MIN_TRADE_UNIT:
-                logger.warning(f"计算数量 {vol} 小于最小交易单位 {self.MIN_TRADE_UNIT}")
                 return False
 
-            # 检查风控
             if not self.can_buy(code, price, vol):
                 return False
 
-            # 应用滑点（买入时加价）
             executed_price = price * (1 + self.slippage)
             required = executed_price * vol
 
-            # 计算手续费
             commission_rate = self.config.get('fees', 'commission_rate', default=0.00025)
             min_commission = self.config.get('fees', 'min_commission', default=5.0)
             fee = max(required * commission_rate, min_commission)
 
             total_cost = required + fee
 
-            # 执行买入
             if self.cash >= total_cost:
                 self.cash -= total_cost
 
-                # 更新内存持仓
                 if code in self.positions:
-                    # 加仓，计算新的成本价
                     old_pos = self.positions[code]
                     total_vol = old_pos['vol'] + vol
                     total_cost_basis = old_pos['cost'] * old_pos['vol'] + executed_price * vol
@@ -459,16 +628,17 @@ class LiveTrader:
                 else:
                     self.positions[code] = {'vol': vol, 'cost': executed_price}
 
-                # 写入数据库
                 self.db.save_trade(code, 'BUY', executed_price, vol, commission_rate, 0)
-
-                # 更新统计
                 self.daily_stats['buy_count'] += 1
+
+                # 更新数据库中的现金余额
+                if hasattr(self.db, 'update_cash_balance'):
+                    self.db.update_cash_balance(self.cash)
 
                 logger.info(f"🟢 买入成交：{code} @ {executed_price:.3f}, 数量: {vol}, 手续费: {fee:.2f}")
                 return True
             else:
-                logger.error(f"❌ 资金不足，买入失败。需要: {total_cost:.2f}, 可用: {self.cash:.2f}")
+                logger.error(f"❌ 资金不足")
                 return False
 
         except Exception as e:
@@ -476,34 +646,25 @@ class LiveTrader:
             return False
 
     def execute_sell(self, code, price, vol=None):
-        """
-        执行卖出操作
-        优化：添加滑点、支持部分卖出、完善错误处理
-        """
+        """执行卖出"""
         try:
             if code not in self.positions:
-                logger.warning(f"⚠️ 持仓中不存在 {code}，无法卖出")
                 return False
 
             pos = self.positions[code]
 
-            # 如果未指定数量，卖出全部
             if vol is None or vol >= pos['vol']:
                 vol = pos['vol']
                 sell_all = True
             else:
                 sell_all = False
-                # 检查是否为100的整数倍
                 vol = int(vol / self.MIN_TRADE_UNIT) * self.MIN_TRADE_UNIT
                 if vol < self.MIN_TRADE_UNIT:
-                    logger.warning(f"卖出数量 {vol} 小于最小交易单位")
                     return False
 
-            # 应用滑点（卖出时减价）
             executed_price = price * (1 - self.slippage)
             income = executed_price * vol
 
-            # 计算手续费
             commission_rate = self.config.get('fees', 'commission_rate', default=0.00025)
             min_commission = self.config.get('fees', 'min_commission', default=5.0)
             stamp_duty_rate = self.config.get('fees', 'stamp_duty_rate', default=0.001)
@@ -514,19 +675,19 @@ class LiveTrader:
 
             self.cash += (income - total_fee)
 
-            # 写入数据库
             self.db.save_trade(code, 'SELL', executed_price, vol, commission_rate, stamp_duty_rate)
 
-            # 更新内存持仓
             if sell_all:
                 del self.positions[code]
             else:
                 pos['vol'] -= vol
 
-            # 更新统计
             self.daily_stats['sell_count'] += 1
 
-            # 计算盈亏
+            # 更新数据库中的现金余额
+            if hasattr(self.db, 'update_cash_balance'):
+                self.db.update_cash_balance(self.cash)
+
             cost_basis = pos['cost'] * vol
             profit = income - cost_basis - total_fee
             pnl_pct = profit / cost_basis if cost_basis > 0 else 0
@@ -540,9 +701,7 @@ class LiveTrader:
             return False
 
     def get_account_summary(self):
-        """
-        获取账户汇总信息
-        """
+        """获取账户汇总"""
         total_position_value = 0
         unrealized_pnl = 0
 
@@ -592,12 +751,7 @@ class LiveTrader:
 
 @contextmanager
 def trader_context(config):
-    """
-    上下文管理器，确保资源正确释放
-    使用示例：
-        with trader_context(config) as trader:
-            trader.run()
-    """
+    """上下文管理器"""
     trader = None
     try:
         trader = LiveTrader(config)
@@ -611,15 +765,11 @@ def trader_context(config):
 
 
 if __name__ == "__main__":
-    # 启动程序
     try:
         config = ConfigLoader()
 
-        # 使用上下文管理器确保资源释放
         with trader_context(config) as trader:
-            # 打印初始账户状态
             trader.print_account_summary()
-            # 运行主循环
             trader.run()
 
     except FileNotFoundError as e:

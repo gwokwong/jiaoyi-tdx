@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  resonance-monitor:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: resonance-alert
+    restart: unless-stopped
+    volumes:
+      - ../config:/app/config
+      - ../logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+    command: python monitor.py --config ../config/config.json
+    # 或者使用命令行参数
+    # command: python monitor.py --interval 300 --limit 100 --score 60
+
+  # 可选：使用定时任务模式（每天交易时间运行）
+  resonance-scheduler:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: resonance-scheduler
+    restart: unless-stopped
+    volumes:
+      - ../config:/app/config
+      - ../logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
+    command: >
+      sh -c "
+        while true; do
+          # 获取当前时间
+          HOUR=$(date +%H)
+          MINUTE=$(date +%H%M)
+          WEEKDAY=$(date +%u)
+          
+          # 判断是否在交易时间（周一到周五，9:30-11:30, 13:00-15:00）
+          if [ $WEEKDAY -le 5 ]; then
+            if [ $MINUTE -ge 0930 ] && [ $MINUTE -le 1130 ] || [ $MINUTE -ge 1300 ] && [ $MINUTE -le 1500 ]; then
+              echo '交易时间内，启动监控...'
+              python monitor.py --config ../config/config.json --always
+            fi
+          fi
+          
+          # 每分钟检查一次
+          sleep 60
+        done
+      "
+    profiles:
+      - scheduler
