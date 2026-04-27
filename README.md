@@ -60,7 +60,88 @@ pip3 install pandas pytdx
 }
 ```
 
-## 📊 功能模块
+## 🎯 策略监控系统 (strategies/)
+
+全市场实时监控模块，支持5000+只股票同时监控，自动交易和飞书通知。
+
+### 五大策略
+
+| 策略 | 核心逻辑 | 最低得分 |
+|------|----------|----------|
+| **放量突破** | 阳线+涨幅≥1%+量比≥1.2+突破20日高点 | 70 |
+| **均线趋势** | MA5>MA10>MA20+股价在MA5上+MA20向上 | 75 |
+| **MACD+KDJ金叉** | MACD金叉+KDJ金叉+MACD红柱+放量 | 70 |
+| **动量突破** | 涨幅>3%+量比>2+MACD红柱+突破5日高点 | 75 |
+| **多周期共振** | 跨周期MACD+KDJ+趋势量能动能共振 | 60 |
+
+### 功能特点
+
+- ✅ **全市场监控**：支持5000+只股票（上海+深圳）
+- ✅ **交易时间**：9:30-11:30, 13:00-15:00，周末自动休眠
+- ✅ **并行扫描**：10线程并发，提高扫描速度
+- ✅ **模拟交易**：自动买入、止损止盈、账户管理
+- ✅ **飞书通知**：发现信号自动推送飞书消息
+- ✅ **独立配置**：每个策略独立的config.json
+
+### 使用方法
+
+```bash
+# 放量突破策略
+cd strategies/breakout_strategy
+python monitor.py
+
+# 均线趋势策略
+cd strategies/ma_trend_strategy
+python monitor.py
+
+# MACD+KDJ策略
+cd strategies/macd_kdj_strategy
+python monitor.py
+
+# 动量策略
+cd strategies/momentum_strategy
+python monitor.py
+
+# 多周期共振策略
+cd strategies/resonance_alert/src
+python full_market_monitor.py
+```
+
+### 配置飞书通知
+
+编辑对应策略的 `config.json`：
+
+```json
+{
+  "notification": {
+    "feishu": {
+      "enabled": true,
+      "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_TOKEN",
+      "secret": "YOUR_SECRET"
+    }
+  }
+}
+```
+
+### 模拟交易参数
+
+```json
+{
+  "trading": {
+    "simulate": true,           // 开启模拟交易
+    "initial_capital": 1000000, // 初始资金100万
+    "position_size": 0.1,       // 单票10%仓位
+    "max_positions": 10,        // 最大10只持仓
+    "stop_loss": -0.05,         // 止损-5%
+    "take_profit": 0.10,        // 止盈10%
+    "max_buys_per_day": 5       // 每日最多买入5次
+  }
+}
+```
+
+---
+
+## 📊 基础功能模块
 
 ### 1. 回测引擎 (backtester.py)
 
